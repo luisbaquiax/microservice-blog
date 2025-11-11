@@ -8,7 +8,8 @@ import {
     publicacionesPorOrientacionPolitica,
     publicacionPorId,
     noticiasPendienteAprobacion,
-    misPublicaciones
+    misPublicaciones,
+    obtenerPublicacionesAmigos
 } from "../controllers/publicacion_controller";
 import { eliminarFotoDePublicacion, agregarFotoAPublicacion } from "../controllers/publicacion_fotos_controllers";
 import { middlewareDeSubida, middlewareDeSubidaLocal } from "../middlewares/multer_config";
@@ -26,6 +27,7 @@ router_publicaciones.get('/por-orientacion/:id_usuario', publicacionesPorOrienta
 router_publicaciones.get('/:id_publicacion', publicacionPorId);
 router_publicaciones.get('/pendientes/lista', noticiasPendienteAprobacion);
 router_publicaciones.get('/mis-publicaciones/:id_usuario', misPublicaciones);
+router_publicaciones.get('/amigos/:id_usuario', obtenerPublicacionesAmigos);
 
 //fotos
 router_publicaciones.delete('/eliminar-foto/:id_foto', eliminarFotoDePublicacion);

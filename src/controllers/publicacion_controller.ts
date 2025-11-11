@@ -1,7 +1,7 @@
 import { Response, Request } from "express";
 import Publicacion from "../models/publicaciones";
 import coneccion from "../database/coneccion";
-import { literal, Op } from "sequelize";
+import { col, literal, Op, where } from "sequelize";
 import Usuario from "../models/usuario";
 import Persona from "../models/persona";
 import { connectRedis, client } from "../database/redis";
@@ -177,48 +177,44 @@ export const publicacionesPublicas = async (req: Request, res: Response) => {
 export const obtenerPublicacionesVisibles = async (req: Request, res: Response) => {
   try {
     const id_usuario_viendo = parseInt(req.params.id_usuario, 10);
+    if (isNaN(id_usuario_viendo)) {
+      return res.status(400).json({ msg: 'El id_usuario proporcionado no es válido.' });
+    }
 
-    // 2. Definir los IDs de los amigos aceptados del usuario actual
-    // Esto se hace con un subquery para usarlo en la condición WHERE
-    const amigosIDs = literal(`
-          (
-              SELECT 
-                  CASE
-                      WHEN T1.id_usuario1 = ${id_usuario_viendo} THEN T1.id_usuario2
-                      ELSE T1.id_usuario1
-                  END
-              FROM amigos AS T1
-              WHERE 
-                  (T1.id_usuario1 = ${id_usuario_viendo} OR T1.id_usuario2 = ${id_usuario_viendo})
-                  AND T1.estado = 'ACEPTADO'
-          )
-      `);
+    // Subconsulta de IDs de amigos aceptados (bidireccional)
+    const amigosSubquery = literal(`
+      SELECT 
+        CASE
+          WHEN a.id_usuario1 = ${id_usuario_viendo} THEN a.id_usuario2
+          ELSE a.id_usuario1
+        END
+      FROM amigos AS a
+      WHERE 
+        (a.id_usuario1 = ${id_usuario_viendo} OR a.id_usuario2 = ${id_usuario_viendo})
+        AND a.estado = 'ACEPTADO'
+    `);
 
-    // 3. Ejecutar la consulta principal de Publicaciones
+    // Consulta principal
     const publicaciones = await Publicacion.findAll({
-      // Solo publicaciones APROBADAS
       where: {
         estado: 'APROBADO',
-
-        // Aplicar la lógica de visibilidad: OR entre PUBLICO y AMIGOS
         [Op.or]: [
-          // A. Publicaciones con visibilidad 'PUBLICO'
+          // Publicaciones públicas
           { visibilidad: 'PUBLICO' },
-
-          // B. Publicaciones con visibilidad 'AMIGOS'
+          // Publicaciones de amigos o propias
           {
-            visibilidad: 'AMIGOS',
-            [Op.or]: [
-              // 1. El autor de la publicación es el propio usuario que está viendo
-              { id_usuario: id_usuario_viendo },
-
-              // 2. El autor de la publicación es uno de sus amigos (usando el subquery)
-              { id_usuario: { [Op.in]: amigosIDs } }
+            [Op.and]: [
+              { visibilidad: 'AMIGOS' },
+              {
+                [Op.or]: [
+                  { id_usuario: id_usuario_viendo },
+                  where(col('Publicacion.id_usuario'), { [Op.in]: amigosSubquery })
+                ]
+              }
             ]
           }
         ]
       },
-      // 4. Incluir el autor de la publicación con sus datos de Persona
       include: [
         {
           model: Usuario,
@@ -233,35 +229,105 @@ export const obtenerPublicacionesVisibles = async (req: Request, res: Response) 
           attributes: ['url_foto', 'descripcion', 'fecha_subida']
         }
       ],
-
       order: [['fecha_publicacion', 'DESC']]
     });
-    // Conectar a Redis si no está conectado
+
+    // Conectar Redis si no está abierto
     if (!client.isOpen) {
       await connectRedis();
     }
 
-    const likePromises = publicaciones.map(publicacion => {
-      const contadorKey = `likes_count:${publicacion.id_publicacion}`;
-      return client.get(contadorKey);
-    });
-
+    // Obtener conteo de likes desde Redis
+    const likePromises = publicaciones.map(p => client.get(`likes_count:${p.id_publicacion}`));
     const likeCounts = await Promise.all(likePromises);
-    const list: PublicacionLike[] = publicaciones.map((publicacion, index) => {
-      const likeCountString = likeCounts[index];
-      const likes = likeCountString ? parseInt(likeCountString, 10) : 0;
 
-      return {
-        publicacion: publicacion,
-        likes: likes
-      };
-    });
+    const list: PublicacionLike[] = publicaciones.map((p, index) => ({
+      publicacion: p,
+      likes: likeCounts[index] ? parseInt(likeCounts[index]!, 10) : 0
+    }));
 
-    res.status(200).json(list);
+    return res.status(200).json(list);
 
   } catch (error) {
     console.error('Error al obtener publicaciones:', error);
-    res.status(500).json({ msg: 'Error al obtener publicaciones.', error: error });
+    return res.status(500).json({
+      msg: 'Error al obtener publicaciones.',
+      error: (error as Error).message
+    });
+  }
+};
+
+//publicaciones de mis amigos
+export const obtenerPublicacionesAmigos = async (req: Request, res: Response) => {
+  try {
+    const id_usuario_viendo = parseInt(req.params.id_usuario, 10);
+    if (isNaN(id_usuario_viendo)) {
+      return res.status(400).json({ msg: 'El id_usuario proporcionado no es válido.' });
+    }
+
+    // 🔹 Subconsulta: obtener los IDs de los amigos aceptados (bidireccional)
+    const amigosSubquery = literal(`
+      (
+        SELECT 
+          CASE
+            WHEN a.id_usuario1 = ${id_usuario_viendo} THEN a.id_usuario2
+            ELSE a.id_usuario1
+          END
+        FROM amigos AS a
+        WHERE 
+          (a.id_usuario1 = ${id_usuario_viendo} OR a.id_usuario2 = ${id_usuario_viendo})
+          AND a.estado = 'ACEPTADO'
+      )
+    `);
+
+    // 🔹 Buscar publicaciones SOLO de amigos
+    const publicaciones = await Publicacion.findAll({
+      where: {
+        estado: 'APROBADO',
+        id_usuario: { [Op.in]: amigosSubquery } // Solo las de amigos aceptados
+      },
+      include: [
+        {
+          model: Usuario,
+          attributes: ['id_usuario', 'nombre_usuario', 'tipo_usuario', 'posicion_politica'],
+          include: [
+            {
+              model: Persona,
+              attributes: ['nombre', 'apellido', 'biografia'],
+            }
+          ]
+        },
+        {
+          model: PublicacionFoto,
+          attributes: ['url_foto', 'descripcion', 'fecha_subida']
+        }
+      ],
+      order: [['fecha_publicacion', 'DESC']]
+    });
+
+    // 🔹 Conectar a Redis si no está conectado
+    if (!client.isOpen) {
+      await connectRedis();
+    }
+
+    // 🔹 Obtener el conteo de likes desde Redis
+    const likePromises = publicaciones.map(p => client.get(`likes_count:${p.id_publicacion}`));
+    const likeCounts = await Promise.all(likePromises);
+
+    // 🔹 Preparar respuesta
+    const list: PublicacionLike[] = publicaciones.map((p, index) => ({
+      publicacion: p,
+      likes: likeCounts[index] ? parseInt(likeCounts[index]!, 10) : 0
+    }));
+
+    return res.status(200).json(list);
+
+  } catch (error) {
+    console.error('Error al obtener publicaciones de amigos:', error);
+    return res.status(500).json({
+      msg: 'Error al obtener publicaciones de amigos.',
+      error: (error as Error).message
+    });
   }
 };
 
